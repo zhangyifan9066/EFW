@@ -319,6 +319,14 @@ void pkt_handler(u_char *dd, const struct pcap_pkthdr *pkthdr, const u_char *dat
             //printf ("arg: %s     ip_spa: %s\n", arg, ip_spa);
             //printf("%s\n", ip_spa);
 
+            char *sss = "192.168.1.6";
+            char *ddd = "140.205.96.1";
+            if ((strcmp(conn.spa, sss) == 0 && strcmp(conn.dpa, ddd) == 0 && conn.sport == 58093 && conn.dport == 80) || 
+                (strcmp(conn.spa, ddd) == 0 && strcmp(conn.dpa, sss) == 0 && conn.dport == 58093 && conn.sport == 80))
+            {
+                printf("from: %s:%u to %s:%u  flag: %u  seq: %u\n", ip_spa, tcp_sport, ip_dpa, tcp_dport, tcp_flags, seq);
+            }
+
             if (tcp_rst == 1)
             {
                 struct connection *ptr = is_conn_in_buf(conn);
@@ -482,7 +490,6 @@ void pkt_handler(u_char *dd, const struct pcap_pkthdr *pkthdr, const u_char *dat
 /*    int i = 0;
     for (i; i < strlen(data); i++)
         printf("%u", data[i]);
-
     printf("\n");
 */
 }

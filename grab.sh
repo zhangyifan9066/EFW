@@ -1,9 +1,9 @@
 #!/bin/bash
 
-tcpdump -i en0 -w sample_large.pcap &
+tcpdump -i en0 -w $1 &
 
 cnt=0
-while [ ${cnt} -lt 20 ];
+while [[ ${cnt} -lt 20 ]];
 do
   #statements
   arp -d -a
