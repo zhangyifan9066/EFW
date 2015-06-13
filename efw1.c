@@ -482,25 +482,349 @@ void process_arp(u_char *dd, const struct pacp_pkthdr *pkthdr, const u_char *dat
 /*
  * Usage:   Process a tcp packet
  */
-void process_tcp()
+void process_tcp(u_char *dd, const struct pcap_pkthdr *pkthdr, const u_char *data, u_short hdr_len, u_char *ip_spa, u_char *ip_dpa)
 {
+    struct tcphdr *tcp_header;                                      // tcp packet header
+    tcp_header = (struct tcphdr *) (data + ETHER_HEADER_LEN + hdr_len);
 
+    uint16_t tcp_sport = ntohs(tcp_header->th_sport);               // source and destination port of the tcp connection
+    uint16_t tcp_dport = ntohs(tcp_header->th_dport);
+    if (tcp_dport == 53)
+    {
+        // if the destination port is 53, the packet is an outgoing DNS packet
+        dns_cnt++;
+        printf("An outgoing DNS packet from %s:%u (%s) to %s:%u (%s)\n", ip_spa, tcp_sport, ethernet_sha, ip_dpa, tcp_dport, ethernet_dha);
+        pcap_dump(dd, pkthdr, data);
+    }
+
+    u_char tcp_flags = tcp_header->th_flags & TH_FLAGS;             // get the connection flags, sequence number and ack from the header
+    u_char tcp_fin = (tcp_flags & TH_FIN);
+    u_char tcp_syn = (tcp_flags & TH_SYN) >> 1;
+    u_char tcp_rst = (tcp_flags & TH_RST) >> 2;
+    u_char tcp_ack = (tcp_flags & TH_ACK) >> 4;
+    tcp_seq seq = ntohl(tcp_header->th_seq);
+    tcp_seq ack = ntohl(tcp_header->th_ack);
+
+    struct connection conn;                         // initialize the connection structure
+    conn.sport = tcp_sport;
+    conn.dport = tcp_dport;
+    memset(conn.spa, 0, 16);
+    memset(conn.dpa, 0, 16);
+    strcpy(conn.spa, ip_spa);
+    strcpy(conn.dpa, ip_dpa);
+    conn.start_time = NULL;
+
+    check_timeout((time_t *)(&pkthdr->ts.tv_sec));      // check all the timers first
+
+    if (tcp_rst == 1)
+    {
+        // it rst flag is 1, terminate the connection
+        struct connection *ptr = is_conn_in_buf(conn);  // check if the connection in the buffer
+        if (ptr != NULL)
+        {
+            // if the connection in the buffer
+            struct timer *tmp = is_in_timer(ptr);       // remove the timer if the connection has some
+            if (tmp != NULL)
+                rm_timer(tmp);
+            rm_buf(ptr);                                // remov the connection form the buffer
+        }
+        int index = is_conn_in_win(conn);               // check if the connection in the buffer
+        if (index >= 0)
+        {
+            // fi the connection in the window
+            printf("Connection terminated (caused by RST) from %s:%d to %s:%d\n", conn_win[index].spa, conn_win[index].sport, conn_win[index].dpa, conn_win[index].dport);
+            struct timer *tmp = is_in_timer(&conn_win[index]);      // remove the timer if the connection has some
+            if (tmp != NULL)
+                rm_timer(tmp);
+            rm_conn(index);                             // remove the connection form the window
+        }
+    } else
+    {
+        // if rst flag is 0
+        char *str = "192.168.1.6";
+        if (tcp_syn == 1 && strcmp(ip_spa, str) == 0)
+        {
+            // if syn flag is 1 (the first packet of three handshake of tcp) and the connection is start from us
+            struct connection *ptr;
+            ptr = is_conn_in_buf(conn);
+            if (ptr == NULL)
+            {
+                conn.sstate = TCPS_SYN_SENT;
+                conn.dstate = TCPS_LISTEN;
+                conn.sseq = seq;
+                add_buf(conn);                  // add the new connection to the buffer
+            }
+        } else
+        {
+            // if it isn't a syn packet from us
+            int index = is_conn_in_win(conn);           // check if the connection is established
+            if (index >= 0) {
+                // if the connection is established
+                if (conn_win[index].sstate == TCPS_ESTABLISHED && conn_win[index].dstate == TCPS_ESTABLISHED)
+                {
+                    // if src and dest state is TCPS_ESTABLISHED
+                    if (tcp_fin == 1 && tcp_ack == 1)
+                    {
+                        // if the a fin packet (the first packet of the four-way handshake), update the states of the connection according to the src of the packet
+                        if (conn_win[index].sport == conn.sport && strcmp(conn_win[index].spa, conn.spa) == 0)
+                            update_conn(index, TCPS_FIN_WAIT_1, TCPS_ESTABLISHED, seq, conn_win[index].dseq);
+                        else if (conn_win[index].sport == conn.dport && strcmp(conn_win[index].spa, conn.dpa) == 0)
+                            update_conn(index, TCPS_ESTABLISHED, TCPS_FIN_WAIT_1, conn_win[index].sseq, seq);
+                    }
+                } else if (conn_win[index].sstate == TCPS_FIN_WAIT_1 && conn_win[index].dstate == TCPS_ESTABLISHED)
+                {
+                    // if the four-way handshake is from us and is waiting for the second packet
+                    if (tcp_ack == 1 && ack == conn_win[index].sseq+1)
+                        // if receive the second packet, update the connection states
+                        update_conn(index, TCPS_FIN_WAIT_2, TCPS_CLOSE_WAIT, conn_win[index].sseq, conn_win[index].dseq);
+                    else if (tcp_fin == 1 && tcp_ack == 1 && conn_win[index].dport == conn.dport && strcmp(conn_win[index].dpa, conn.dpa) == 0)
+                        // if receive another fin packet from the server, indicate this is a simultaneous closing
+                        update_conn(index, TCPS_FIN_WAIT_1, TCPS_FIN_WAIT_1, conn_win[index].sseq, seq);
+                } else if (conn_win[index].sstate == TCPS_FIN_WAIT_2 && conn_win[index].dstate == TCPS_CLOSE_WAIT)
+                {
+                    // if the four-way handshake is from us and is waiting to send the third packet
+                    if (tcp_fin == 1 && tcp_ack == 1)
+                        // if is sending the third packet, update the connection states
+                        update_conn(index, TCPS_FIN_WAIT_2, TCPS_LAST_ACK, conn_win[index].sseq, seq);
+                } else if (conn_win[index].sstate == TCPS_FIN_WAIT_2 && conn_win[index].dstate == TCPS_LAST_ACK)
+                {
+                    // if the four-way handshake is from us and is waiting for the last packet
+                    if (tcp_ack == 1 && ack == conn_win[index].dseq+1)
+                    {
+                        // if receive the last packet, update the connection states and start a timer for the termination
+                        update_conn(index, TCPS_TIME_WAIT, TCPS_LAST_ACK, conn_win[index].sseq, conn_win[index].dseq);
+                        set_start_time(&conn_win[index], (time_t *)(&pkthdr->ts.tv_sec));
+                    } 
+                } else if (conn_win[index].sstate == TCPS_TIME_WAIT && conn_win[index].dstate == TCPS_LAST_ACK)
+                {
+                    // the connection is waiting to be closed
+                    if ((tcp_fin == 1 && tcp_ack == 1) && strcmp(conn_win[index].dpa, conn.spa) == 0 && conn_win[index].dport == conn.sport)
+                        // the final packet is lost, and a retransmission packet is receiverd, roll back the state
+                        update_conn(index, TCPS_FIN_WAIT_2, TCPS_LAST_ACK, conn_win[index].sseq, seq);
+                } else if (conn_win[index].sstate == TCPS_ESTABLISHED && conn_win[index].dstate == TCPS_FIN_WAIT_1)
+                {
+                    // if the four-way handshake is from the server and is waiting to the second packet
+                    if (tcp_ack == 1 && ack == conn_win[index].dseq+1)
+                        // if is sending the second packet, update the connection states
+                        update_conn(index, TCPS_CLOSE_WAIT, TCPS_FIN_WAIT_2, conn_win[index].sseq, conn_win[index].dseq);
+                    else if (tcp_fin == 1 && tcp_ack == 1 && conn_win[index].sport == conn.sport && strcmp(conn_win[index].spa, conn.spa) == 0)
+                        // if send another fin packet from us, indicate this is a simultaneous closing
+                        update_conn(index, TCPS_FIN_WAIT_1, TCPS_FIN_WAIT_1, seq, conn_win[index].dseq);
+                } else if (conn_win[index].sstate == TCPS_CLOSE_WAIT && conn_win[index].dstate == TCPS_FIN_WAIT_2)
+                {
+                    // if the four-way handshake is from the server and is waiting for the third packet
+                    if (tcp_fin == 1 && tcp_ack == 1)
+                        // if receive the third packet, update the connection states
+                        update_conn(index, TCPS_LAST_ACK, TCPS_FIN_WAIT_2, seq, conn_win[index].dseq);
+                } else if (conn_win[index].sstate == TCPS_LAST_ACK && conn_win[index].dstate == TCPS_FIN_WAIT_2)
+                {
+                    // if the four-way handshake is from the server and is waiting send the last packet
+                    if (tcp_ack == 1 && ack == conn_win[index].sseq+1)
+                    {
+                        // if is sending the last packet, update the connection states and start a timer for the termination
+                        update_conn(index, TCPS_LAST_ACK, TCPS_TIME_WAIT, conn_win[index].sseq, conn_win[index].dseq);
+                        set_start_time(&conn_win[index], (time_t *)(&pkthdr->ts.tv_sec));
+                    } 
+                } else if (conn_win[index].sstate == TCPS_LAST_ACK && conn_win[index].dstate == TCPS_TIME_WAIT)
+                {
+                    // the connection is waiting to be closed
+                    if ((tcp_fin == 1 && tcp_ack == 1) && strcmp(conn_win[index].spa, conn.spa) == 0 && conn_win[index].sport == conn.sport)
+                        // the final packet is lost, and a retransmission packet is receiverd, roll back the state
+                        update_conn(index, TCPS_LAST_ACK, TCPS_FIN_WAIT_2, seq, conn_win[index].dseq);
+                } else if (conn_win[index].sstate == TCPS_FIN_WAIT_1 && conn_win[index].dstate == TCPS_FIN_WAIT_1)
+                {
+                    // if src and dest state is TCPS_FIN_WAIT_1, the connection is being simultaneously closing
+                    if (conn_win[index].sport == conn.sport && strcmp(conn_win[index].spa, conn.spa) == 0)
+                    {
+                        // if the packet is sent from us
+                        if (tcp_ack == 1 && ack == conn_win[index].dseq+1)
+                        {
+                            // if the packet is the ack packet to the fin, update the server (dest) state to TCPS_TIME_WAIT and start a timer for termination
+                            update_conn(index, TCPS_CLOSING, TCPS_TIME_WAIT, conn_win[index].sseq, conn_win[index].dseq);
+                            set_start_time(&conn_win[index], (time_t *)(&pkthdr->ts.tv_sec));
+                        }
+                    } else if (conn_win[index].sport == conn.dport && strcmp(conn_win[index].spa, conn.dpa) == 0)
+                    {
+                        // if the packet is sent from the server
+                        if (tcp_ack == 1 && ack == conn_win[index].sseq+1)
+                        {
+                            // if the packet is the ack packet to the fin, update the our (src) state to TCPS_TIME_WAIT and start a timer for termination
+                            update_conn(index, TCPS_TIME_WAIT, TCPS_CLOSING, conn_win[index].sseq, conn_win[index].dseq);
+                            set_start_time(&conn_win[index], (time_t *)(&pkthdr->ts.tv_sec));
+                        }
+                    }
+                } else if (conn_win[index].sstate == TCPS_CLOSING && conn_win[index].dstate == TCPS_TIME_WAIT)
+                {
+                    // when simultaneously closing and the server is waiting for the ack packet
+                    if (tcp_ack == 1 && ack == conn_win[index].sseq+1 && conn_win[index].sport == conn.sport && strcmp(conn_win[index].spa, conn.spa) == 0)
+                    {
+                        // the other ack packet packet is send from us, both are reaching the state of TCPS_TIME_WAIT, update the start time of the timer
+                        update_conn(index, TCPS_TIME_WAIT, TCPS_TIME_WAIT, conn_win[index].sseq, conn_win[index].dseq);
+                        set_start_time(&conn_win[index], (time_t *)(&pkthdr->ts.tv_sec));
+                    } else if (tcp_fin == 1 && tcp_ack == 1)
+                        // the first ack packet is lost, and a retransmission packet is sent or received, roll back the state
+                        update_conn(index, TCPS_FIN_WAIT_1, TCPS_FIN_WAIT_1, conn_win[index].sseq, conn_win[index].dseq);
+                } else if (conn_win[index].sstate == TCPS_TIME_WAIT && conn_win[index].dstate == TCPS_CLOSING)
+                {
+                    // when simultaneously closing and we are waiting for the ack packet
+                    if (tcp_ack == 1 && ack == conn_win[index].dseq+1 && conn_win[index].sport == conn.dport && strcmp(conn_win[index].spa, conn.dpa) == 0)
+                    {
+                        // the other ack packet packet is send from the server, both are reaching the state of TCPS_TIME_WAIT, update the start time of the timer
+                        update_conn(index, TCPS_TIME_WAIT, TCPS_TIME_WAIT, conn_win[index].sseq, conn_win[index].dseq);
+                        set_start_time(&conn_win[index], (time_t *)(&pkthdr->ts.tv_sec));
+                    } else if (tcp_fin == 1 && tcp_ack == 1)
+                        // the first ack packet is lost, and a retransmission packet is sent or received, roll back the state
+                        update_conn(index, TCPS_FIN_WAIT_1, TCPS_FIN_WAIT_1, conn_win[index].sseq, conn_win[index].dseq);
+                } else if (conn_win[index].sstate == TCPS_TIME_WAIT && conn_win[index].dstate == TCPS_TIME_WAIT)
+                {
+                    // if both are waiting for the timeout 
+                    if (tcp_fin == 1 && tcp_ack == 1 && conn_win[index].sport == conn.sport && strcmp(conn_win[index].spa, conn.spa) == 0)
+                        // the second ack packet is lost, and a retransmission packet is sent from us, roll back the state
+                        update_conn(index, TCPS_CLOSING, TCPS_TIME_WAIT, conn_win[index].sseq, conn_win[index].dseq);
+                    else if (tcp_fin == 1 && tcp_ack == 1 && conn_win[index].sport == conn.dport && strcmp(conn_win[index].spa, conn.dpa) == 0)
+                        // the second ack packet is lost, and a retransmission packet is sent from the server, roll back the state
+                        update_conn(index, TCPS_TIME_WAIT, TCPS_CLOSING, conn_win[index].sseq, conn_win[index].dseq);
+                }
+            } else
+            {
+                // if the connection is being established
+                struct connection * ptr = is_conn_in_buf(conn);         // the connection should be in the buffer
+                if (ptr != NULL)
+                {
+                    // if the connection is in the buffer
+                    if (ptr->sstate == TCPS_SYN_SENT && ptr->dstate == TCPS_LISTEN)
+                    {
+                        // if is wait for the second packet for the three handshake (the syn/ack packet from the server)
+                        if (tcp_syn == 1 && tcp_ack == 1 && ack == ptr->sseq+1)
+                            // if it is the second packet, update the state
+                            update_buf(ptr, TCPS_SYN_SENT, TCPS_SYN_RECEIVED, ptr->sseq, seq);\
+                    } else if (ptr->sstate == TCPS_SYN_SENT && ptr->dstate == TCPS_SYN_RECEIVED)
+                    {
+                        // if is wait for the last packet for the three handshake (the ack packet from us)
+                        if (tcp_ack == 1 && ack == ptr->dseq+1)
+                        {
+                            // if it is the second packet, update the state, and start a timer for the connection establishment
+                            update_buf(ptr, TCPS_ESTABLISHED, TCPS_SYN_RECEIVED, ptr->sseq, ptr->dseq);
+                            set_start_time(ptr, (time_t *)(&pkthdr->ts.tv_sec));
+                        }
+                    } else if (ptr->sstate == TCPS_ESTABLISHED && ptr->dstate == TCPS_SYN_RECEIVED)
+                    {
+                        // if is waiting for the timeout
+                        if (!(tcp_syn == 1 && tcp_ack == 1) && strcmp(ptr->dpa, conn.spa) == 0 && ptr->dpa == conn.dpa)
+                        {
+                            // if is not reach the timeout, be we get a normal data packet from the server, indicating the server has received final packet and the connection is established
+                            int chosen_index = is_win_full();           // check if the connection window is full
+                            if (chosen_index >= 0)
+                            {
+                                // if the window is not full, establish a new connection, move the connection from the buffer to the window 
+                                update_buf(ptr, TCPS_ESTABLISHED, TCPS_ESTABLISHED, ptr->sseq, ptr->dseq);
+                                add_conn(chosen_index, *ptr);
+                                printf("Connection established from %s:%d to %s:%d\n", ptr->spa, ptr->sport, ptr->dpa, ptr->dport);
+                                int j;
+                                int c = 0;
+                                for (j = 0; j < MAX_CONNECTION; j++)
+                                    if (avail_conn[j] == false)
+                                        c++;
+                                printf("Current connection number: %d\n", c);
+                                rm_buf(ptr);
+                            } else
+                            {
+                                // if the window is full, discard the connection
+                                printf("Connection discarded from %s:%d to %s:%d\n", ptr->spa, ptr->sport, ptr->dpa, ptr->dport);
+                                rm_buf(ptr);
+                            }
+
+                            struct timer *tmp = is_in_timer(&conn);         // if the connection has start a timer, remove it
+                            if (tmp != NULL)
+                                rm_timer(tmp);
+                        } else if ((tcp_syn == 1 && tcp_ack == 1 && ack == ptr->sseq+1) && strcmp(ptr->dpa, conn.spa) == 0 && ptr->dpa == conn.dpa)
+                        {
+                            // if received a retransmission packet, roll back the state
+                            update_buf(ptr, TCPS_SYN_SENT, TCPS_SYN_RECEIVED, ptr->sseq, seq);
+                        } else if (tcp_fin == 1 && tcp_ack == 1)
+                        {
+                            // if before the timeout, the first four-way handshake packet is send or received
+                            int chosen_index = is_win_full();       // check the window is full
+                            if (chosen_index >= 0)
+                            {
+                                // if the window is not full, establish a new connection, move the connection from the buffer to the window
+                                update_buf(ptr, TCPS_ESTABLISHED, TCPS_ESTABLISHED, ptr->sseq, ptr->dseq);
+                                add_conn(chosen_index, *ptr);
+                                printf("Connection established from %s:%d to %s:%d\n", ptr->spa, ptr->sport, ptr->dpa, ptr->dport);
+                                int j;
+                                int c = 0;
+                                for (j = 0; j < MAX_CONNECTION; j++)
+                                    if (avail_conn[j] == false)
+                                        c++;
+                                printf("Current connection number: %d\n", c);
+                                rm_buf(ptr);
+
+                                // update the state for sent or received the first four-way handshake packet
+                                if (conn_win[index].sport == conn.sport && strcmp(conn_win[index].spa, conn.spa) == 0)
+                                    update_conn(index, TCPS_FIN_WAIT_1, TCPS_ESTABLISHED, seq, conn_win[index].dseq);
+                                else if (conn_win[index].sport == conn.dport && strcmp(conn_win[index].spa, conn.dpa) == 0)
+                                    update_conn(index, TCPS_ESTABLISHED, TCPS_FIN_WAIT_1, conn_win[index].sseq, seq);
+                            } else
+                            {
+                                // if the window is full, discard the connection
+                                printf("Connection discarded from %s:%d to %s:%d\n", ptr->spa, ptr->sport, ptr->dpa, ptr->dport);
+                                rm_buf(ptr);
+                            }
+
+                            struct timer *tmp = is_in_timer(&conn);         // if the connection has start a timer, remove it
+                            if (tmp != NULL)
+                                rm_timer(tmp);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /*
  * Usage:   Process a udp packet
  */
-void process_udp()
+void process_udp(u_char *dd, const struct pcap_pkthdr *pkthdr, const u_char *data, u_short hdr_len, u_char *ip_spa, u_char *ip_dpa)
 {
+    struct udphdr *udp_header;                                      // udp header
+    udp_header = (struct udphdr *) (data + ETHER_HEADER_LEN + hdr_len);
 
+    uint16_t udp_sport = ntohs(udp_header->uh_sport);               // source and destination port of the udp connection
+    uint16_t udp_dport = ntohs(udp_header->uh_dport);
+    if (udp_dport == 53)
+    {
+        // if the destination port is 53, the packet is an outgoing packet
+        dns_cnt++;
+        printf("An outgoing DNS packet from %s:%u (%s) to %s:%u (%s)\n", ip_spa, udp_sport, ethernet_sha, ip_dpa, udp_dport, ethernet_dha);
+        pcap_dump(dd, pkthdr, data);
+    }
 }
 
 /*
  * Usage:   Process an ip packet
  */
-void process_ip()
+void process_ip(u_char *dd, const struct pcap_pkthdr *pkthdr, const u_char *data)
 {
+    struct ip *ip_header;                                               // ip packet header
+    ip_header = (struct ip *) (data + ETHER_HEADER_LEN);
 
+    u_short hdr_len = ((u_short)IP_VHL_HL(ip_header->ip_vhl) << 2);     // calculate the length of the ip packet header
+    u_char ip_spa[16];                                                    // get source and destination ip address from the header
+    u_char ip_dpa[16];
+    strcpy(ip_spa, inet_ntoa(ip_header->ip_src));
+    strcpy(ip_dpa, inet_ntoa(ip_header->ip_dst));
+
+    u_char protocol = ip_header->ip_p;                                  // get the protocol of the packet
+    if (protocol == 6)
+    {
+        // if it is a tcp packet
+        process_tcp(dd, pkthdr, data, hdr_len, ip_spa, ip_dpa);
+    } else if (protocol == 17)
+    {
+        // if it is a udp packet
+        process_udp(dd, pkthdr, data, hdr_len, ip_spa, ip_dpa);
+    }
 }
 
 /*
@@ -523,331 +847,7 @@ void pkt_handler(u_char *dd, const struct pcap_pkthdr *pkthdr, const u_char *dat
     } else if (ntohs(ethernet_header->ether_type) == ETHERTYPE_IP)
     {
         // if the packet is a ip packet
-        struct ip *ip_header;                                               // ip packet header
-        ip_header = (struct ip *) (data + ETHER_HEADER_LEN);
-
-        u_short hdr_len = ((u_short)IP_VHL_HL(ip_header->ip_vhl) << 2);     // calculate the length of the ip packet header
-        char ip_spa[16];                                                    // get source and destination ip address from the header
-        char ip_dpa[16];
-        strcpy(ip_spa, inet_ntoa(ip_header->ip_src));
-        strcpy(ip_dpa, inet_ntoa(ip_header->ip_dst));
-
-        u_char protocol = ip_header->ip_p;                                  // get the protocol of the packet
-        if (protocol == 6)
-        {
-            // if it is a tcp packet
-            struct tcphdr *tcp_header;                                      // tcp packet header
-            tcp_header = (struct tcphdr *) (data + ETHER_HEADER_LEN + hdr_len);
-
-            uint16_t tcp_sport = ntohs(tcp_header->th_sport);               // source and destination port of the tcp connection
-            uint16_t tcp_dport = ntohs(tcp_header->th_dport);
-            if (tcp_dport == 53)
-            {
-                // if the destination port is 53, the packet is an outgoing DNS packet
-                dns_cnt++;
-                printf("An outgoing DNS packet from %s:%u (%s) to %s:%u (%s)\n", ip_spa, tcp_sport, ethernet_sha, ip_dpa, tcp_dport, ethernet_dha);
-                pcap_dump(dd, pkthdr, data);
-                //printf("dns in tcp");
-            }
-
-            u_char tcp_flags = tcp_header->th_flags & TH_FLAGS;
-            u_char tcp_fin = (tcp_flags & TH_FIN);
-            u_char tcp_syn = (tcp_flags & TH_SYN) >> 1;
-            u_char tcp_rst = (tcp_flags & TH_RST) >> 2;
-            u_char tcp_ack = (tcp_flags & TH_ACK) >> 4;
-            tcp_seq seq = ntohl(tcp_header->th_seq);
-            tcp_seq ack = ntohl(tcp_header->th_ack);
-
-            //printf("flags: %u\n", tcp_flags); 
-
-            struct connection conn;
-            conn.sport = tcp_sport;
-            conn.dport = tcp_dport;
-            memset(conn.spa, 0, 16);
-            memset(conn.dpa, 0, 16);
-            strcpy(conn.spa, ip_spa);
-            strcpy(conn.dpa, ip_dpa);
-            conn.start_time = NULL;
-
- //           conn.seq = seq;
-
-            //printf("fin %u; syn %u; rst %u; ack %u    flags %u    ip: %s   tip: %s\n", tcp_fin, tcp_syn, tcp_rst, tcp_ack, tcp_flags, ip_spa, arg);
-            //if (tcp_flags == 18)
-            //printf("from: %s:%u to %s:%u  flag: %u  seq: %u\n", ip_spa, tcp_sport, ip_dpa, tcp_dport, tcp_flags, seq);
-            //printf ("arg: %s     ip_spa: %s\n", arg, ip_spa);
-            //printf("%s\n", ip_spa);
-
-            check_timeout((time_t *)(&pkthdr->ts.tv_sec));
-
-            char *sss = "192.168.1.6";
-            char *ddd = "140.205.96.1";
-            if ((strcmp(conn.spa, sss) == 0 && strcmp(conn.dpa, ddd) == 0 && conn.sport == 58093 && conn.dport == 80) || 
-                (strcmp(conn.spa, ddd) == 0 && strcmp(conn.dpa, sss) == 0 && conn.dport == 58093 && conn.sport == 80))
-            {
-                printf("from: %s:%u to %s:%u  flag: %u  seq: %u  ack: %u\n", ip_spa, tcp_sport, ip_dpa, tcp_dport, tcp_flags, seq, ack);
-            }
-
-            if (tcp_rst == 1)
-            {
-                struct connection *ptr = is_conn_in_buf(conn);
-                if (ptr != NULL)
-                {
-                    struct timer *tmp = is_in_timer(ptr);
-                    if (tmp != NULL)
-                        rm_timer(tmp);
-                    rm_buf(ptr);
-                    //printf("ssss\n");
-                }
-                int index = is_conn_in_win(conn);
-                if (index >= 0)
-                {
-                    printf("Connection terminated (caused by RST) from %s:%d to %s:%d\n", conn_win[index].spa, conn_win[index].sport, conn_win[index].dpa, conn_win[index].dport);
-                    struct timer *tmp = is_in_timer(&conn_win[index]);
-                    if (tmp != NULL)
-                        rm_timer(tmp);
-                    rm_conn(index);
-                }
-            } else
-            {
-                if ((strcmp(conn.spa, sss) == 0 && strcmp(conn.dpa, ddd) == 0 && conn.sport == 58093 && conn.dport == 80) || 
-                    (strcmp(conn.spa, ddd) == 0 && strcmp(conn.dpa, sss) == 0 && conn.dport == 58093 && conn.sport == 80))
-                {
-                    printf("V1");
-                }
-                char *str = "192.168.1.6";
-                if (tcp_syn == 1 && strcmp(ip_spa, str) == 0)
-                {
-                    //printf("tcp_syn == 1\n");
-                    //if (strcmp(ip_spa, str) == 0)
-                    //{
-                    //printf("!!!!!!   0\n");
-                    struct connection *ptr;
-                    ptr = is_conn_in_buf(conn);
-                    if (ptr == NULL)
-                    {
-                        conn.sstate = TCPS_SYN_SENT;
-                        conn.dstate = TCPS_LISTEN;
-                        conn.sseq = seq;
-                        add_buf(conn);
-                    }
-                        //printf("from: %s:%u to %s:%u  flag: %u  seq: %u\n", ip_spa, tcp_sport, ip_dpa, tcp_dport, tcp_flags, seq);
-                    //}
-                } else
-                {
-                    //printf("tcp_syn != 1\n");
-                    //if (tcp_flags == 18)
-                        //printf("1\n");
-                    if ((strcmp(conn.spa, sss) == 0 && strcmp(conn.dpa, ddd) == 0 && conn.sport == 58093 && conn.dport == 80) || 
-                        (strcmp(conn.spa, ddd) == 0 && strcmp(conn.dpa, sss) == 0 && conn.dport == 58093 && conn.sport == 80))
-                    {
-                        printf("V2");
-                    }
-                    int index = is_conn_in_win(conn);
-                    if (index >= 0) {
-                        printf("v0\n");
-                        if (conn_win[index].sstate == TCPS_ESTABLISHED && conn_win[index].dstate == TCPS_ESTABLISHED)
-                        {
-                            printf("v1\n");
-                            if (tcp_fin == 1 && tcp_ack == 1)
-                            {
-                                if (conn_win[index].sport == conn.sport && strcmp(conn_win[index].spa, conn.spa) == 0)
-                                    update_conn(index, TCPS_FIN_WAIT_1, TCPS_ESTABLISHED, seq, conn_win[index].dseq);
-                                else if (conn_win[index].sport == conn.dport && strcmp(conn_win[index].spa, conn.dpa) == 0)
-                                    update_conn(index, TCPS_ESTABLISHED, TCPS_FIN_WAIT_1, conn_win[index].sseq, seq);
-                            }
-                        } else if (conn_win[index].sstate == TCPS_FIN_WAIT_1 && conn_win[index].dstate == TCPS_ESTABLISHED)
-                        {
-                            printf("v2-1\n");
-                            if (tcp_ack == 1 && ack == conn_win[index].sseq+1)
-                                update_conn(index, TCPS_FIN_WAIT_2, TCPS_CLOSE_WAIT, conn_win[index].sseq, conn_win[index].dseq);
-                            else if (tcp_fin == 1 && tcp_ack == 1 && conn_win[index].dport == conn.dport && strcmp(conn_win[index].dpa, conn.dpa) == 0)
-                                update_conn(index, TCPS_FIN_WAIT_1, TCPS_FIN_WAIT_1, conn_win[index].sseq, seq);
-                        } else if (conn_win[index].sstate == TCPS_FIN_WAIT_2 && conn_win[index].dstate == TCPS_CLOSE_WAIT)
-                        {
-                            printf("v3-1\n");
-                            if (tcp_fin == 1 && tcp_ack == 1)
-                                update_conn(index, TCPS_FIN_WAIT_2, TCPS_LAST_ACK, conn_win[index].sseq, seq);
-                        } else if (conn_win[index].sstate == TCPS_FIN_WAIT_2 && conn_win[index].dstate == TCPS_LAST_ACK)
-                        {
-                            printf("v4-1\n");
-                            if (tcp_ack == 1 && ack == conn_win[index].dseq+1)
-                            {
-                                update_conn(index, TCPS_TIME_WAIT, TCPS_LAST_ACK, conn_win[index].sseq, conn_win[index].dseq);
-                                set_start_time(&conn_win[index], (time_t *)(&pkthdr->ts.tv_sec));
-                                printf("start\n");
-                            } 
-                        } else if (conn_win[index].sstate == TCPS_TIME_WAIT && conn_win[index].dstate == TCPS_LAST_ACK)
-                        {
-                            if ((tcp_fin == 1 && tcp_ack == 1) && strcmp(conn_win[index].dpa, conn.spa) == 0 && conn_win[index].dport == conn.sport)
-                                update_conn(index, TCPS_FIN_WAIT_2, TCPS_LAST_ACK, conn_win[index].sseq, seq);
-                        } else if (conn_win[index].sstate == TCPS_ESTABLISHED && conn_win[index].dstate == TCPS_FIN_WAIT_1)
-                        {
-                            if (tcp_ack == 1 && ack == conn_win[index].dseq+1)
-                                update_conn(index, TCPS_CLOSE_WAIT, TCPS_FIN_WAIT_2, conn_win[index].sseq, conn_win[index].dseq);
-                            else if (tcp_fin == 1 && tcp_ack == 1 && conn_win[index].sport == conn.sport && strcmp(conn_win[index].spa, conn.spa) == 0)
-                                update_conn(index, TCPS_FIN_WAIT_1, TCPS_FIN_WAIT_1, seq, conn_win[index].dseq);
-                        } else if (conn_win[index].sstate == TCPS_CLOSE_WAIT && conn_win[index].dstate == TCPS_FIN_WAIT_2)
-                        {
-                            if (tcp_fin == 1 && tcp_ack == 1)
-                                update_conn(index, TCPS_LAST_ACK, TCPS_FIN_WAIT_2, seq, conn_win[index].dseq);
-                        } else if (conn_win[index].sstate == TCPS_LAST_ACK && conn_win[index].dstate == TCPS_FIN_WAIT_2)
-                        {
-                            if (tcp_ack == 1 && ack == conn_win[index].sseq+1)
-                            {
-                                update_conn(index, TCPS_LAST_ACK, TCPS_TIME_WAIT, conn_win[index].sseq, conn_win[index].dseq);
-                                set_start_time(&conn_win[index], (time_t *)(&pkthdr->ts.tv_sec));
-                                printf("start\n");
-                            } 
-                        } else if (conn_win[index].sstate == TCPS_LAST_ACK && conn_win[index].dstate == TCPS_TIME_WAIT)
-                        {
-                            if ((tcp_fin == 1 && tcp_ack == 1) && strcmp(conn_win[index].spa, conn.spa) == 0 && conn_win[index].sport == conn.sport)
-                                update_conn(index, TCPS_LAST_ACK, TCPS_FIN_WAIT_2, seq, conn_win[index].dseq);
-                        } else if (conn_win[index].sstate == TCPS_FIN_WAIT_1 && conn_win[index].dstate == TCPS_FIN_WAIT_1)
-                        {
-                            if (conn_win[index].sport == conn.sport && strcmp(conn_win[index].spa, conn.spa) == 0)
-                            {
-                                if (tcp_ack == 1 && ack == conn_win[index].dseq+1)
-                                {
-                                    update_conn(index, TCPS_CLOSING, TCPS_TIME_WAIT, conn_win[index].sseq, conn_win[index].dseq);
-                                    set_start_time(&conn_win[index], (time_t *)(&pkthdr->ts.tv_sec));
-                                }
-                            } else if (conn_win[index].sport == conn.dport && strcmp(conn_win[index].spa, conn.dpa) == 0)
-                            {
-                                if (tcp_ack == 1 && ack == conn_win[index].sseq+1)
-                                {
-                                    update_conn(index, TCPS_TIME_WAIT, TCPS_CLOSING, conn_win[index].sseq, conn_win[index].dseq);
-                                    set_start_time(&conn_win[index], (time_t *)(&pkthdr->ts.tv_sec));
-                                }
-                            }
-                        } else if (conn_win[index].sstate == TCPS_CLOSING && conn_win[index].dstate == TCPS_TIME_WAIT)
-                        {
-                            if (tcp_ack == 1 && ack == conn_win[index].sseq+1 && conn_win[index].sport == conn.sport && strcmp(conn_win[index].spa, conn.spa) == 0)
-                            {
-                                update_conn(index, TCPS_TIME_WAIT, TCPS_TIME_WAIT, conn_win[index].sseq, conn_win[index].dseq);
-                                set_start_time(&conn_win[index], (time_t *)(&pkthdr->ts.tv_sec));
-                            }
-                        } else if (conn_win[index].sstate == TCPS_TIME_WAIT && conn_win[index].dstate == TCPS_CLOSING)
-                        {
-                            if (tcp_ack == 1 && ack == conn_win[index].dseq+1 && conn_win[index].sport == conn.dport && strcmp(conn_win[index].spa, conn.dpa) == 0)
-                            {
-                                update_conn(index, TCPS_TIME_WAIT, TCPS_TIME_WAIT, conn_win[index].sseq, conn_win[index].dseq);
-                                set_start_time(&conn_win[index], (time_t *)(&pkthdr->ts.tv_sec));
-                            }
-                        } else if (conn_win[index].sstate == TCPS_TIME_WAIT && conn_win[index].dstate == TCPS_TIME_WAIT)
-                        {
-                            if (tcp_fin == 1 && tcp_ack == 1)
-                                update_conn(index, TCPS_FIN_WAIT_1, TCPS_FIN_WAIT_1, conn_win[index].sseq, conn_win[index].dseq);
-                        }
-                    } else
-                    {
-                        //printf("!!!!!!   1\n");
-                        //if (tcp_flags == 18)
-                            //printf("2\n");
-                            //printf("from: %s:%u to %s:%u  flag: %u  seq: %u\n", ip_spa, tcp_sport, ip_dpa, tcp_dport, tcp_flags, seq);
-
-                        if ((strcmp(conn.spa, sss) == 0 && strcmp(conn.dpa, ddd) == 0 && conn.sport == 58093 && conn.dport == 80) || 
-                            (strcmp(conn.spa, ddd) == 0 && strcmp(conn.dpa, sss) == 0 && conn.dport == 58093 && conn.sport == 80))
-                        {
-                            printf("V3");
-                        }
-                        struct connection * ptr = is_conn_in_buf(conn);
-                        if (ptr != NULL)
-                        {
-                            //if (tcp_flags == 18)
-                                //printf("3\n");
-                            if ((strcmp(conn.spa, sss) == 0 && strcmp(conn.dpa, ddd) == 0 && conn.sport == 58093 && conn.dport == 80) || 
-                                (strcmp(conn.spa, ddd) == 0 && strcmp(conn.dpa, sss) == 0 && conn.dport == 58093 && conn.sport == 80))
-                            {
-                                printf("V4\n");
-                                printf("fin:  %u   ack:  %u    sstate:  %u    dstate: %u    sseq: %u    dseq:%u\n", tcp_fin, tcp_ack, ptr->sstate, ptr->dstate, ptr->sseq, ptr->dseq);
-
-                            }
-                            if (ptr->sstate == TCPS_SYN_SENT && ptr->dstate == TCPS_LISTEN)
-                            {
-                                //printf("!!!!!!   2\n");
-                                //if (tcp_flags == 18)
-                                    //printf("4\n");
-            //printf("!!!!!!!!!from: %s:%u to %s:%u  flag: %u  seq: %u\n", ip_spa, tcp_sport, ip_dpa, tcp_dport, tcp_flags, seq);
-                                if (tcp_syn == 1 && tcp_ack == 1 && ack == ptr->sseq+1)
-                                    update_buf(ptr, TCPS_SYN_SENT, TCPS_SYN_RECEIVED, ptr->sseq, seq);\
-                            } else if (ptr->sstate == TCPS_SYN_SENT && ptr->dstate == TCPS_SYN_RECEIVED)
-                            {
-                                //printf("!!!!!!   3\n");
-                                if (tcp_ack == 1 && ack == ptr->dseq+1)
-                                {
-                                    update_buf(ptr, TCPS_ESTABLISHED, TCPS_SYN_RECEIVED, ptr->sseq, ptr->dseq);
-                                    set_start_time(ptr, (time_t *)(&pkthdr->ts.tv_sec));
-                                }
-                            } else if (ptr->sstate == TCPS_ESTABLISHED && ptr->dstate == TCPS_SYN_RECEIVED)
-                            {
-                                //printf("ddddd\n");
-                                /*if ((strcmp(conn.spa, sss) == 0 && strcmp(conn.dpa, ddd) == 0 && conn.sport == 58093 && conn.dport == 80) || 
-                                    (strcmp(conn.spa, ddd) == 0 && strcmp(conn.dpa, sss) == 0 && conn.dport == 58093 && conn.sport == 80))
-                                {
-                                    printf("fin:  %u   ack:  %u\n", tcp_fin, tcp_ack);
-                                }*/
-                                if (!(tcp_syn == 1 && tcp_ack == 1) && strcmp(ptr->dpa, conn.spa) == 0 && ptr->dpa == conn.dpa)
-                                {
-                                    //free(ptr->start_time);
-                                    //ptr->start_time = NULL;
-                                    //printf("qqqqqq\n");
-
-                                    int chosen_index = is_win_full();
-                                    if (chosen_index >= 0)
-                                    {
-                                        update_buf(ptr, TCPS_ESTABLISHED, TCPS_ESTABLISHED, ptr->sseq, ptr->dseq);
-                                        add_conn(chosen_index, *ptr);
-                                        printf("Connection established dfsggf from %s:%d to %s:%d\n", ptr->spa, ptr->sport, ptr->dpa, ptr->dport);
-                                        int j;
-                                        int c = 0;
-                                        for (j = 0; j < MAX_CONNECTION; j++)
-                                            if (avail_conn[j] == false)
-                                                c++;
-                                        printf("Current connection number: %d\n", c);
-                                        //printf("Connection established from %s:%d to %s:%d\n", conn_win[chosen_index].spa, conn_win[chosen_index].sport, conn_win[chosen_index].dpa, conn_win[chosen_index].dport);
-                                        rm_buf(ptr);
-                                    } else
-                                    {
-                                        printf("Connection discarded from %s:%d to %s:%d\n", ptr->spa, ptr->sport, ptr->dpa, ptr->dport);
-                                        rm_buf(ptr);
-                                    }
-
-                                    struct timer *tmp = is_in_timer(&conn);
-                                    if (tmp != NULL)
-                                        rm_timer(tmp);
-                                } else if ((tcp_syn == 1 && tcp_ack == 1 && ack == ptr->sseq+1) && strcmp(ptr->dpa, conn.spa) == 0 && ptr->dpa == conn.dpa)
-                                {
-                                    update_buf(ptr, TCPS_SYN_SENT, TCPS_SYN_RECEIVED, ptr->sseq, seq);
-                                    //set_start_time(ptr, (time *)(&pkthdr->ts.tv_sec));
-                                } else if (tcp_fin == 1 && tcp_ack == 1)
-                                {
-                                    if (conn_win[index].sport == conn.sport && strcmp(conn_win[index].spa, conn.spa) == 0)
-                                        update_conn(index, TCPS_FIN_WAIT_1, TCPS_ESTABLISHED, seq, conn_win[index].dseq);
-                                    else if (conn_win[index].sport == conn.dport && strcmp(conn_win[index].spa, conn.dpa) == 0)
-                                        update_conn(index, TCPS_ESTABLISHED, TCPS_FIN_WAIT_1, conn_win[index].sseq, seq);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-        } else if (protocol == 17)
-        {
-            // if it is a udp packet
-            struct udphdr *udp_header;                                      // udp header
-            udp_header = (struct udphdr *) (data + ETHER_HEADER_LEN + hdr_len);
-
-            uint16_t udp_sport = ntohs(udp_header->uh_sport);               // source and destination port of the udp connection
-            uint16_t udp_dport = ntohs(udp_header->uh_dport);
-            if (udp_dport == 53)
-            {
-                // if the destination port is 53, the packet is an outgoing packet
-                dns_cnt++;
-                printf("An outgoing DNS packet from %s:%u (%s) to %s:%u (%s)\n", ip_spa, udp_sport, ethernet_sha, ip_dpa, udp_dport, ethernet_dha);
-                pcap_dump(dd, pkthdr, data);
-            }
-        }
+        process_ip(dd, pkthdr, data);
     }
 }
 
